@@ -1,0 +1,202 @@
+---
+title: "Housing Market Predictors"
+---
+
+## 1. Introduction
+
+The objective of this analysis is to build a multiple linear regression model to predict the prices of houses
+
+
+```{r}
+install.packages("corrplot")
+library(corrplot)
+library(tidyverse)
+```
+
+```{r}
+house_data <- read.csv("house_train.csv")
+```
+
+## 2. Data Cleaning and Exploratory Data Analysis (EDA)
+
+We need to understand what is going on in the data and be able to potentially remove null values and create new columns
+
+### Data Inspection
+
+Look at summary of data including the first couple rows and data types
+
+```{r}
+head(house_data)
+
+str(house_data)
+```
+
+```{r}
+# Get a summary of the dataset
+summary(house_data)
+```
+
+**Observations:**
+
+* The dataset contains 18 columns and 3680 rows.
+* The X column appears to be an unnecessary row index, which we will remove.
+* Columns like `bedrooms`, `bathrooms`, `floors`, `waterfront`, `view`, and `condition` are numerical but are just other ways to categorize the house
+* `yr_built` and `yr_renovated` are year variables. We could potentially include the houses age
+* `street`, `city`, `statezip`, and `country` are character variables. `country` has only one unique value ("USA") and can be removed. `statezip` and `city` can be converted into factors.`
+
+
+### Data Cleaning
+
+We will now clean the data based on our initial observations. We'll also add a new column, `age`, representing the age of the house at the time of sale.
+
+```{r}
+# Find year the house was sold
+sale_year <- max(c(house_data$yr_built, house_data$yr_renovated[house_data$yr_renovated > 0]), na.rm = TRUE)
+
+# Clean and transform the data
+house_clean <- house_data %>%
+  # Create age column
+  mutate(
+    age = sale_year - yr_built,
+    city = as.factor(city)
+  ) %>%
+# Remove useless columns
+select(-X, -country, -statezip, -street, -yr_built, -yr_renovated)
+
+# Move columns to have price in front
+house_clean <- house_clean %>%
+  select(price, everything())
+
+head(house_clean)
+```
+
+### Exploratory Analysis and Find Relationships
+
+#### Correlation Matrix
+
+A correlation plot helps visualize the linear relationships between numeric variables.
+
+```{r}
+# Select only numeric columns for the correlation matrix
+numeric_vars <- house_clean %>%
+  select_if(is.numeric)
+
+# find correlation matrix
+cor_matrix <- cor(numeric_vars)
+
+# Plot it
+corrplot(cor_matrix, method = "color", type = "upper", order = "hclust",
+         tl.col = "black", tl.srt = 45, addCoef.col = "black", number.cex = 0.6)
+```
+
+**Observations:**
+
+* As expected, `price` is strongly and positively correlated with `sqft_living`, `sqft_above`, and `bathrooms`.
+* `sqft_living` is highly correlated with `sqft_above`, also since `sqft_above` is part of `sqft_living`.
+
+#### Price Distribution
+
+Now the distribution of our target variable, `price`.
+
+```{r}
+options(repr.plot.width=6, repr.plot.height=4) # Adjust plot size
+ggplot(house_clean, aes(x = price)) +
+  geom_histogram(bins = 80, fill = "darkred", color = "black") +
+  scale_x_continuous(labels = scales::comma, limits = c(0, 5000000)) + # Set x-axis limit
+  labs(title = "Distribution of Housing Prices", x = "Price ($)", y = "Number of Houses")
+```
+
+Some values were not included in the following graph in order to zoom in and have a more detailed plot but they were not removed from the final dataset.The price is right-skewed. So to transform it to a normal distribution a log transformation is a common remedy for right-skewness.
+
+```{r}
+ggplot(house_clean, aes(x = log(price))) +
+  geom_histogram(bins = 50, fill = "lightgreen", color = "black") +
+  labs(title = "Distribution of Log-Transformed Housing Prices", x = "Log(Price)", y = "Frequency")
+```
+
+The log-transformed price appears much more normally distributed. We will use `log(price)` as our response variable.
+
+### Model Features
+
+We will use `log(price)` as the response. Based on we we've seen, we'll include interactions between:
+1.  `sqft_living` and `condition`: The value of an extra square foot might depend on the condition of the house.
+2.  `age` The effect of age on price might be different for renovated vs. un-renovated homes.
+3.  `bedrooms` and `bathrooms`: These are often considered together by buyers.
+
+### Train the model data
+
+```{r}
+house_model_data <- house_clean %>%
+  filter(price > 0) %>%
+  mutate(log_price = log(price)) %>%
+  select(-price)
+
+# simple multiple regression
+main_model <- lm(log_price ~ ., data = house_model_data)
+
+# Display the summary of the simple model
+summary(main_model)
+```
+
+```{r}
+# Fit a more complex model with additional interactions and city
+final_model <- lm(log_price ~ bedrooms + bathrooms + sqft_living * condition +
+                 age + bedrooms * bathrooms + city,
+                 data = house_model_data)
+
+# Display the summary of the full model
+summary(final_model)
+```
+
+**Final Model Analysis:**
+
+The `final_model` selected through backward elimination is slightly simpler but retains almost the same explanatory power, with an **Adjusted R-squared of 0.6939**. We now use for prediction on the test data.
+
+### 5. Model Validation on Test Data
+
+The most important test of a model is its ability to perform on new, unseen data. We will now load and clean the `house_test.csv` Then, we'll use our `main_model` to make predictions and evaluate its accuracy.
+
+```{r}
+house_test <- read.csv("house_test.csv")
+
+# Apply same cleaning
+house_test_clean <- house_test %>%
+  mutate(
+    age = sale_year - yr_built,
+    city = factor(city, levels = levels(house_model_data$city)) # Convert city to factor with levels from training data
+  ) %>%
+  select(-X, -country, -statezip, -street, -yr_built, -yr_renovated)
+
+# predict the price
+predictions <- predict(main_model, newdata = house_test_clean)
+
+# convert from log(price) back to price
+predicted_prices <- exp(predictions)
+actual_prices <- house_test_clean$price
+
+# Create a data frame for evaluation and remove rows with NA values (due to city factor levels not in training)
+results <- data.frame(Actual = actual_prices, Predicted = predicted_prices) %>%
+  na.omit()
+
+rss <- sum((results$Predicted - results$Actual)^2)
+tss <- sum((results$Actual - mean(results$Actual))^2)
+test_r_squared <- 1 - (rss/tss)
+
+rmse <- sqrt(mean((results$Predicted - results$Actual)^2))
+
+print(paste("Test Set R-squared:", round(test_r_squared, 4)))
+print(paste("Test Set RMSE: $", round(rmse, 2)))
+```
+
+**Test Performance Discussion:**
+
+* **Test Set R-squared**: The R-squared on the test data is a measure of how well our model generalizes to new data. A value close to the training R-squared (0.6527).
+* **Root Mean Squared Error (RMSE)**: The RMSE gives us the typical error of our predictions in dollars. A lower RMSE indicates a more accurate model. For example, an RMSE of 240,000 means our model's price predictions are, on average, off by about 240,000.
+
+## 5. Conclusion
+
+We have successfully built and analyzed an initial multiple linear regression model to predict housing prices.
+
+* **Data preparation** was key, involving feature engineering (`age`) and transformation of the skewed `price` variable using a natural logarithm.
+* The initial model, including all predictors and selected interactions, showed **strong explanatory power** (High R-squared).
+
